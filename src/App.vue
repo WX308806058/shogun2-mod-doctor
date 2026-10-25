@@ -31,17 +31,32 @@
     <div v-if="pub.show" class="modal-mask" @click.self="!pub.busy && (pub.show = false)">
       <div class="modal left">
         <h3>发布新版</h3>
-        <p class="pub-hint">将自动完成：git add/commit → 创建附注标签 → 推送 main + tag（走 Clash 代理），云端约 10 分钟出安装包。</p>
-        <label class="f-label">版本号（x.y.z）</label>
-        <input v-model="pub.version" class="f-input" placeholder="0.2.1" />
-        <label class="f-label">发布说明（写入 tag 注释与 Release 页）</label>
-        <textarea v-model="pub.notes" class="f-area" rows="4" placeholder="本版本更新内容…"></textarea>
-        <p v-if="pub.msg" class="pub-msg">{{ pub.msg }}</p>
-        <p v-if="pub.err" class="pub-err">{{ pub.err }}</p>
+        <p class="pub-hint">提交 → 推送 → 打附注标签，GitHub Actions 自动构建并发布。版本号由标签自动同步，无需改配置。</p>
+        <label class="f-label">项目目录</label>
+        <input class="f-input" readonly :value="pubStatus.projectDir || '未找到仓库（发布功能仅限开发机）'" />
+        <label class="f-label">发布版本</label>
+        <input v-model="pub.version" class="f-input" placeholder="0.2.2" />
+        <p class="status-line">
+          <template v-if="pubStatus.err">⚠ {{ pubStatus.err }}</template>
+          <template v-else>
+            最新标签 <b>{{ pubStatus.latestTag || "无" }}</b> · 分支 {{ pubStatus.branch || "?" }} ·
+            <span :class="pubStatus.dirty ? 'dirty' : 'clean'">{{ pubStatus.dirty ? `工作区有 ${pubStatus.dirty} 处改动` : "工作区无改动" }}</span>
+          </template>
+        </p>
+        <label class="f-label">提交说明</label>
+        <input v-model="pub.commitMsg" class="f-input" placeholder="chore: release v0.2.2" />
+        <label class="f-label">发布说明（可选：写入标签注释，显示在 GitHub Release 页面；留空则用固定文案）</label>
+        <textarea v-model="pub.notes" class="f-area" rows="3" placeholder="本次更新内容…"></textarea>
         <div class="row-btns">
+          <button class="ghost" :disabled="pub.busy" @click="refreshStatus">刷新状态</button>
           <button class="ghost" :disabled="pub.busy" @click="doPublish(true)">试运行</button>
-          <button class="primary" :disabled="pub.busy" @click="doPublish(false)">{{ pub.busy ? "推送中…" : "发布" }}</button>
+          <button class="primary" :disabled="pub.busy" @click="doPublish(false)">{{ pub.busy ? "推送中…" : "发布新版本" }}</button>
           <button class="ghost" :disabled="pub.busy" @click="pub.show = false">关闭</button>
+        </div>
+        <label class="f-label">执行日志（{{ logs.length }} 条）</label>
+        <div class="log-panel">
+          <div v-for="(l, i) in logs" :key="i" class="log-line"><span class="log-time">{{ l.time }}</span>{{ l.msg }}</div>
+          <div v-if="!logs.length" class="log-line log-time">就绪。填写版本号后点击「试运行」或「发布新版本」。</div>
         </div>
       </div>
     </div>
@@ -142,7 +157,17 @@ const checking = ref(false);
 const updateInfo = ref<{ show: boolean; latest: string; url: string; err: string }>({
   show: false, latest: "", url: "", err: "",
 });
-const pub = ref({ show: false, version: "", notes: "", busy: false, msg: "", err: "" });
+const pub = ref({ show: false, version: "", commitMsg: "", notes: "", busy: false });
+const pubStatus = ref<{ projectDir: string; latestTag: string; branch: string; dirty: number; nextVersion: string; err: string }>({
+  projectDir: "", latestTag: "", branch: "", dirty: 0, nextVersion: "", err: "",
+});
+const logs = ref<{ time: string; msg: string }[]>([]);
+
+function addLog(msg: string) {
+  const t = new Date();
+  const time = [t.getHours(), t.getMinutes(), t.getSeconds()].map((x) => String(x).padStart(2, "0")).join(":");
+  logs.value.push({ time, msg });
+}
 
 const pct = computed(() =>
   progress.value.total ? Math.round((progress.value.current / progress.value.total) * 100) : 0
@@ -174,30 +199,42 @@ function openPage(url: string) {
   invoke("open_release_page", { url }).catch(() => {});
 }
 
+async function refreshStatus() {
+  try {
+    const s = await invoke<any>("repo_status");
+    pubStatus.value = { ...s, err: "" };
+    if (!pub.value.version) pub.value.version = s.nextVersion;
+    if (!pub.value.commitMsg) pub.value.commitMsg = `chore: release v${s.nextVersion}`;
+  } catch (e) {
+    pubStatus.value = { ...pubStatus.value, err: String(e) };
+  }
+}
+
 function openPublish() {
-  const parts = (appVersion.value || "0.2.0").split(".").map((x) => parseInt(x) || 0);
-  parts[2] += 1;
-  pub.value = { show: true, version: parts.join("."), notes: "", busy: false, msg: "", err: "" };
+  pub.value = { show: true, version: "", commitMsg: "", notes: "", busy: false };
+  logs.value = [];
+  refreshStatus();
 }
 
 async function doPublish(dryRun: boolean) {
-  if (!pub.value.version.trim() || !pub.value.notes.trim()) {
-    pub.value.err = "版本号与发布说明都需要填写";
+  if (!pub.value.version.trim() || !pub.value.commitMsg.trim()) {
+    addLog("错误：版本号与提交说明都需要填写");
     return;
   }
   pub.value.busy = true;
-  pub.value.msg = "";
-  pub.value.err = "";
   try {
-    pub.value.msg = await invoke<string>("publish_release", {
+    const msg = await invoke<string>("publish_release", {
       version: pub.value.version.trim(),
+      commitMsg: pub.value.commitMsg.trim(),
       notes: pub.value.notes.trim(),
       dryRun,
     });
+    addLog(msg);
   } catch (e) {
-    pub.value.err = String(e);
+    addLog("失败：" + String(e));
   } finally {
     pub.value.busy = false;
+    refreshStatus();
   }
 }
 
@@ -206,6 +243,9 @@ onMounted(() => {
   getVersion().then((v) => { appVersion.value = v; }).catch(() => {});
   listen<{ current: number; total: number; name: string }>("scan-progress", (e) => {
     progress.value = e.payload;
+  }).catch(() => {});
+  listen<string>("publish-log", (e) => {
+    addLog(e.payload);
   }).catch(() => {});
 });
 
@@ -271,8 +311,14 @@ button.ghost:hover { background: #eef4ff; }
 button.primary { padding: 7px 18px; background: #2563eb; color: #fff; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; }
 button.primary:hover { background: #1d4fd8; }
 button:disabled { opacity: .55; cursor: wait; }
-.modal.left { text-align: left; width: 500px; }
+.modal.left { text-align: left; width: 560px; }
 .modal.left h3 { margin-bottom: 10px; }
+.status-line { font-size: 12.5px; color: #667; margin: 8px 0 2px; }
+.status-line .dirty { color: #b8860b; font-weight: 500; }
+.status-line .clean { color: #1e8449; }
+.log-panel { height: 170px; overflow-y: auto; background: #1e2430; border-radius: 8px; padding: 10px 12px; font-family: Consolas, monospace; font-size: 12px; line-height: 1.7; }
+.log-line { color: #cdd6e4; white-space: pre-wrap; word-break: break-all; }
+.log-time { color: #6b7a94; margin-right: 8px; }
 .pub-hint { font-size: 12px; color: #778; background: #f2f6ff; border-radius: 6px; padding: 8px 10px; margin-bottom: 12px; line-height: 1.6; }
 .f-label { display: block; font-size: 12.5px; color: #556; margin: 10px 0 4px; }
 .f-input, .f-area { width: 100%; padding: 8px 10px; border: 1px solid #ccd2d9; border-radius: 6px; font-size: 13px; font-family: inherit; box-sizing: border-box; }

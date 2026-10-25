@@ -102,51 +102,106 @@ fn open_release_page(url: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 一键发布：commit（如有变更）→ 附注 tag → 推送 main 与 tag（走代理，失败直连重试）
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepoStatus {
+    project_dir: String,
+    latest_tag: String,
+    branch: String,
+    dirty: u32,
+    next_version: String,
+}
+
+/// 仓库状态：最新标签 / 当前分支 / 工作区改动数 / 建议的下一版本
 #[tauri::command]
-fn publish_release(version: String, notes: String, dry_run: bool) -> Result<String, String> {
+fn repo_status() -> Result<RepoStatus, String> {
+    if !std::path::Path::new(PROJECT_DIR).join(".git").exists() {
+        return Err(format!("未找到本机仓库 {}", PROJECT_DIR));
+    }
+    let tags = run_git(PROJECT_DIR, false, &["tag", "-l", "--sort=-v:refname"])
+        .map_err(|e| format!("读取标签失败: {}", e))?;
+    let latest_tag = tags.lines().next().unwrap_or("").trim().to_string();
+    let branch = run_git(PROJECT_DIR, false, &["branch", "--show-current"])
+        .map_err(|e| e.to_string())?
+        .trim()
+        .to_string();
+    let st = run_git(PROJECT_DIR, false, &["status", "--porcelain"]).map_err(|e| e.to_string())?;
+    let dirty = st.lines().filter(|l| !l.trim().is_empty()).count() as u32;
+    // 建议版本 = 最新标签 patch + 1
+    let next_version = {
+        let v = latest_tag.trim_start_matches('v');
+        let parts: Vec<u32> = v.split('.').filter_map(|s| s.parse().ok()).collect();
+        if parts.len() == 3 {
+            format!("{}.{}.{}", parts[0], parts[1], parts[2] + 1)
+        } else {
+            "0.1.0".into()
+        }
+    };
+    Ok(RepoStatus { project_dir: PROJECT_DIR.into(), latest_tag, branch, dirty, next_version })
+}
+
+/// 一键发布：commit（如有变更）→ 附注 tag → 推送 main 与 tag（走代理，失败直连重试）
+/// 每一步通过 publish-log 事件推送带序号的日志行
+#[tauri::command]
+fn publish_release(
+    app: tauri::AppHandle,
+    version: String,
+    commit_msg: String,
+    notes: String,
+    dry_run: bool,
+) -> Result<String, String> {
+    let handle = app.clone();
+    let log = move |msg: &str| {
+        let _ = handle.emit("publish-log", msg);
+    };
     let v = version.trim().trim_start_matches(['v', 'V']).to_string();
     let parts: Vec<&str> = v.split('.').collect();
     if parts.len() != 3 || parts.iter().any(|s| s.parse::<u32>().is_err()) {
-        return Err("版本号格式应为 x.y.z，例如 0.2.1".into());
+        return Err("版本号格式应为 x.y.z，例如 0.2.2".into());
     }
-    if notes.trim().is_empty() {
-        return Err("发布说明不能为空".into());
+    if commit_msg.trim().is_empty() {
+        return Err("提交说明不能为空".into());
     }
     if !std::path::Path::new(PROJECT_DIR).join(".git").exists() {
-        return Err("未找到本机仓库 D:/Shou2Mods/Shogun2ModDoctor（发布功能仅限开发机使用）".into());
+        return Err(format!("未找到本机仓库 {}（发布功能仅限开发机使用）", PROJECT_DIR));
     }
     let tag = format!("v{}", v);
-    // tag 已存在则拒绝
+    log(&format!("检查标签 {} 是否已存在…", tag));
     if run_git(PROJECT_DIR, false, &["rev-parse", "--verify", &format!("refs/tags/{}", tag)]).is_ok() {
         return Err(format!("标签 {} 已存在，请换一个版本号", tag));
     }
-    // 暂存全部变更（无变更时 commit 会失败，忽略即可）
+    log("暂存工作区变更…");
     run_git(PROJECT_DIR, false, &["add", "-A"])?;
-    let commit_msg = format!("v{}: {}", v, notes);
-    let committed = run_git(PROJECT_DIR, false, &["commit", "-m", &commit_msg]).is_ok();
+    let st = run_git(PROJECT_DIR, false, &["status", "--porcelain"]).unwrap_or_default();
+    let staged = st.lines().filter(|l| !l.trim().is_empty()).count();
+    log(&format!("已暂存 {} 处变更", staged));
     if dry_run {
-        let status = run_git(PROJECT_DIR, false, &["status", "--short"])?;
-        return Ok(format!(
-            "试运行通过。已暂存变更（{}提交 commit）。正式发布会创建标签 {} 并推送 main + {}（走代理 {}）。\n当前未提交内容：{}",
-            if committed { "已" } else { "无变更，跳过" }, tag, tag, PROXY,
-            if status.trim().is_empty() { "无".into() } else { status })
-        );
+        log("试运行结束：未创建标签、未推送。");
+        return Ok(format!("试运行通过：将创建标签 {} 并推送 main + {}。", tag, tag));
     }
-    let _ = run_git(PROJECT_DIR, false, &["commit", "-m", &commit_msg]);
+    log(&format!("提交：{}", commit_msg.trim()));
+    if run_git(PROJECT_DIR, false, &["commit", "-m", commit_msg.trim()]).is_ok() {
+        log("提交完成");
+    } else {
+        log("无新变更，跳过 commit");
+    }
+    log(&format!("创建附注标签 {}…", tag));
     run_git(PROJECT_DIR, false, &["tag", "-a", &tag, "-m", notes.trim()])?;
-    // 推送：代理优先，失败直连重试
-    let push_main = run_git(PROJECT_DIR, true, &["push", "origin", "main"])
-        .or_else(|_| run_git(PROJECT_DIR, false, &["push", "origin", "main"]));
-    let push_tag = run_git(PROJECT_DIR, true, &["push", "origin", &tag])
-        .or_else(|_| run_git(PROJECT_DIR, false, &["push", "origin", &tag]));
-    match (push_main, push_tag) {
-        (Ok(_), Ok(_)) => Ok(format!(
-            "已推送 {}。GitHub Actions 云端构建约 10 分钟，完成后可在 Releases 页下载安装包。",
-            tag
-        )),
+    log("推送 main（优先走 Clash 代理）…");
+    let pm = run_git(PROJECT_DIR, true, &["push", "origin", "main"])
+        .or_else(|_| { log("代理失败，改直连重试…"); run_git(PROJECT_DIR, false, &["push", "origin", "main"]) });
+    log(&format!("推送 main：{}", if pm.is_ok() { "成功" } else { "失败" }));
+    log(&format!("推送标签 {}…", tag));
+    let pt = run_git(PROJECT_DIR, true, &["push", "origin", &tag])
+        .or_else(|_| { log("代理失败，改直连重试…"); run_git(PROJECT_DIR, false, &["push", "origin", &tag]) });
+    match (pm, pt) {
+        (Ok(_), Ok(_)) => {
+            log(&format!("全部推送成功。GitHub Actions 构建约 10 分钟，随后可在 Releases 页下载 {} 安装包。", tag));
+            Ok(format!("{} 发布完成。", tag))
+        }
         (e1, e2) => {
-            let _ = run_git(PROJECT_DIR, false, &["tag", "-d", &tag]); // 推送失败撤销本地 tag
+            let _ = run_git(PROJECT_DIR, false, &["tag", "-d", &tag]);
+            log(&format!("推送失败，已撤销本地标签 {}。", tag));
             Err(format!(
                 "推送失败（请确认 Clash 已开启）。\nmain: {}\ntag: {}",
                 e1.map(|_| "OK".into()).unwrap_or_else(|e| e),
@@ -186,6 +241,7 @@ fn main() {
             scan_game,
             check_update,
             open_release_page,
+            repo_status,
             publish_release
         ])
         .run(tauri::generate_context!())

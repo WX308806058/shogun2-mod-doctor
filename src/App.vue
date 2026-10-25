@@ -10,7 +10,7 @@
     </div>
 
     <!-- 检查更新结果 -->
-    <div v-if="updateInfo.show" class="modal-mask" @click.self="updateInfo.show = false">
+    <div v-if="updateInfo.show" class="modal-mask" @click.self="!updateInfo.downloading && (updateInfo.show = false)">
       <div class="modal">
         <h3>检查更新</h3>
         <template v-if="updateInfo.latest">
@@ -18,9 +18,17 @@
             发现新版本 <b>v{{ updateInfo.latest }}</b>（当前 v{{ appVersion }}）
           </p>
           <p v-else class="upd-ok">已是最新版本（v{{ appVersion }}）</p>
+          <p v-if="updateInfo.downloading" class="upd-downloading">正在下载安装包（约 2.2MB，gh-proxy 镜像优先）…</p>
+          <p v-if="updateInfo.downloaded" class="upd-ok">✔ 下载完成。点击「立即安装」将退出应用并静默安装新版，完成后从桌面快捷方式打开即可。</p>
           <div class="row-btns">
-            <button v-if="isNewer(updateInfo.latest, appVersion)" class="primary" @click="openPage(updateInfo.url)">前往下载页</button>
-            <button class="ghost" @click="updateInfo.show = false">关闭</button>
+            <button
+              v-if="isNewer(updateInfo.latest, appVersion)"
+              class="primary"
+              :disabled="updateInfo.downloading"
+              @click="updateInfo.downloaded ? installNow() : downloadAndInstall()"
+            >{{ updateInfo.downloading ? "下载中…" : updateInfo.downloaded ? "立即安装" : "一键下载并安装" }}</button>
+            <button class="ghost" @click="openPage(updateInfo.url)">打开发布页</button>
+            <button class="ghost" :disabled="updateInfo.downloading" @click="updateInfo.show = false">关闭</button>
           </div>
         </template>
         <p v-else class="upd-err">{{ updateInfo.err }}</p>
@@ -154,9 +162,29 @@ const error = ref("");
 const progress = ref({ current: 0, total: 0, name: "" });
 const appVersion = ref("");
 const checking = ref(false);
-const updateInfo = ref<{ show: boolean; latest: string; url: string; err: string }>({
-  show: false, latest: "", url: "", err: "",
+const updateInfo = ref<{ show: boolean; latest: string; url: string; asset: string; err: string; downloading: boolean; downloaded: string }>({
+  show: false, latest: "", url: "", asset: "", err: "", downloading: false, downloaded: "",
 });
+
+async function downloadAndInstall() {
+  if (!updateInfo.value.asset) {
+    updateInfo.value.err = "该版本未找到安装包资产，请用「打开发布页」手动下载";
+    return;
+  }
+  updateInfo.value.downloading = true;
+  try {
+    const path = await invoke<string>("download_update", { assetUrl: updateInfo.value.asset });
+    updateInfo.value.downloaded = path;
+  } catch (e) {
+    updateInfo.value.err = String(e);
+  } finally {
+    updateInfo.value.downloading = false;
+  }
+}
+
+function installNow() {
+  invoke("install_update", { path: updateInfo.value.downloaded }).catch(() => {});
+}
 const pub = ref({ show: false, version: "", commitMsg: "", notes: "", busy: false });
 const pubStatus = ref<{ projectDir: string; latestTag: string; branch: string; dirty: number; nextVersion: string; err: string }>({
   projectDir: "", latestTag: "", branch: "", dirty: 0, nextVersion: "", err: "",
@@ -186,10 +214,10 @@ async function checkUpdate() {
   checking.value = true;
   try {
     const res = await invoke<string>("check_update");
-    const { tag, url } = JSON.parse(res);
-    updateInfo.value = { show: true, latest: tag.replace(/^v/, ""), url, err: "" };
+    const { tag, url, asset } = JSON.parse(res);
+    updateInfo.value = { show: true, latest: tag.replace(/^v/, ""), url, asset, err: "", downloading: false, downloaded: "" };
   } catch (e) {
-    updateInfo.value = { show: true, latest: "", url: "", err: String(e) };
+    updateInfo.value = { show: true, latest: "", url: "", asset: "", err: String(e), downloading: false, downloaded: "" };
   } finally {
     checking.value = false;
   }

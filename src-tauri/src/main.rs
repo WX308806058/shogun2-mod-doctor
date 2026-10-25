@@ -75,21 +75,94 @@ fn run_git(dir: &str, proxy: bool, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// 检查更新：查 GitHub 最新 Release
+/// 检查更新：查 GitHub 最新 Release，返回 tag / 发布页 / 安装包直链
 #[tauri::command]
 fn check_update() -> Result<String, String> {
     let txt = gh_api("/repos/WX308806058/shogun2-mod-doctor/releases/latest")?;
     let v: serde_json::Value =
         serde_json::from_str(&txt).map_err(|e| format!("响应解析失败: {}", e))?;
-    match (
-        v.get("tag_name").and_then(|x| x.as_str()),
-        v.get("html_url").and_then(|x| x.as_str()),
-    ) {
-        (Some(tag), Some(url)) => {
-            Ok(serde_json::json!({ "tag": tag, "url": url }).to_string())
-        }
-        _ => Err("响应解析失败".into()),
+    let tag = v
+        .get("tag_name")
+        .and_then(|x| x.as_str())
+        .ok_or("响应解析失败")?
+        .to_string();
+    let url = v
+        .get("html_url")
+        .and_then(|x| x.as_str())
+        .ok_or("响应解析失败")?
+        .to_string();
+    // 找 setup.exe 资产的直链
+    let asset = v["assets"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter().find(|a| {
+                a["name"]
+                    .as_str()
+                    .map(|n| n.starts_with("Shogun2ModDoctor") && n.ends_with("-setup.exe"))
+                    .unwrap_or(false)
+            })
+        })
+        .and_then(|a| a["browser_download_url"].as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(serde_json::json!({ "tag": tag, "url": url, "asset": asset }).to_string())
+}
+
+/// 下载新版安装包到临时目录（gh-proxy 镜像优先，其次直链+代理，最后直链直连）
+#[tauri::command]
+fn download_update(asset_url: String) -> Result<String, String> {
+    if !asset_url.starts_with("https://github.com/WX308806058/shogun2-mod-doctor/releases/download/") {
+        return Err("不允许的下载地址".into());
     }
+    let dest = format!(
+        "{}\\Shogun2ModDoctor_update_setup.exe",
+        std::env::temp_dir().display()
+    );
+    let sources = [
+        format!("https://gh-proxy.com/{}", asset_url),
+        asset_url.clone(),
+    ];
+    let mut last_err = String::new();
+    for u in &sources {
+        for use_proxy in [true, false] {
+            let mut cmd = Command::new("curl");
+            cmd.arg("-sSL")
+                .arg("--retry")
+                .arg("2")
+                .arg("-m")
+                .arg("600")
+                .arg("-o")
+                .arg(&dest);
+            if use_proxy {
+                cmd.arg("--proxy").arg(PROXY);
+            }
+            cmd.arg(u);
+            if let Ok(out) = cmd.output() {
+                if out.status.success() {
+                    if let Ok(md) = std::fs::metadata(&dest) {
+                        if md.len() > 1_000_000 {
+                            return Ok(dest);
+                        }
+                    }
+                }
+            }
+            last_err = format!("源 {}（{}）下载失败", u, if use_proxy { "代理" } else { "直连" });
+        }
+    }
+    Err(format!("下载失败（可尝试开启 Clash）。{}", last_err))
+}
+
+/// 运行已下载的安装包静默安装；应用随即退出，装完从桌面快捷方式重新打开即为新版
+#[tauri::command]
+fn install_update(path: String) -> Result<(), String> {
+    if !path.contains("Shogun2ModDoctor_update_setup.exe") || !std::path::Path::new(&path).exists() {
+        return Err("安装包不存在".into());
+    }
+    Command::new(&path)
+        .arg("/S")
+        .spawn()
+        .map_err(|e| format!("启动安装程序失败: {}", e))?;
+    std::process::exit(0);
 }
 
 /// 查询某 tag 的云端构建状态（GitHub Actions）
@@ -273,6 +346,8 @@ fn main() {
             default_game_dir,
             scan_game,
             check_update,
+            download_update,
+            install_update,
             open_release_page,
             repo_status,
             ci_status,

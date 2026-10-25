@@ -11,7 +11,27 @@ const DEFAULT_GAME: &str = "D:/Program Files/Steam/steamapps/common/Total War SH
 /// 发布功能使用的本机仓库路径（发布功能仅限开发机）
 const PROJECT_DIR: &str = "D:/Shou2Mods/Shogun2ModDoctor";
 const REPO_API: &str = "https://api.github.com/repos/WX308806058/shogun2-mod-doctor/releases/latest";
+const REPO_BASE: &str = "https://github.com/WX308806058/shogun2-mod-doctor";
 const PROXY: &str = "http://127.0.0.1:7890";
+
+/// GitHub API 请求：curl 优先走代理，失败自动直连
+fn gh_api(path: &str) -> Result<String, String> {
+    for use_proxy in [true, false] {
+        let mut cmd = Command::new("curl");
+        cmd.arg("-s").arg("-m").arg("20").arg("-L");
+        if use_proxy {
+            cmd.arg("--proxy").arg(PROXY);
+        }
+        cmd.arg("-H").arg("Accept: application/vnd.github+json");
+        cmd.arg(format!("https://api.github.com{}", path));
+        if let Ok(out) = cmd.output() {
+            if out.status.success() && !out.stdout.is_empty() {
+                return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+            }
+        }
+    }
+    Err("无法访问 GitHub API（可尝试开启 Clash 后重试）".into())
+}
 
 #[tauri::command]
 fn default_game_dir() -> String {
@@ -55,38 +75,51 @@ fn run_git(dir: &str, proxy: bool, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// 检查更新：查 GitHub 最新 Release（curl 优先走代理，失败自动直连）
+/// 检查更新：查 GitHub 最新 Release
 #[tauri::command]
 fn check_update() -> Result<String, String> {
-    let mut last_err = String::new();
-    for use_proxy in [true, false] {
-        let mut cmd = Command::new("curl");
-        cmd.arg("-s").arg("-m").arg("20").arg("-L");
-        if use_proxy {
-            cmd.arg("--proxy").arg(PROXY);
+    let txt = gh_api("/repos/WX308806058/shogun2-mod-doctor/releases/latest")?;
+    let v: serde_json::Value =
+        serde_json::from_str(&txt).map_err(|e| format!("响应解析失败: {}", e))?;
+    match (
+        v.get("tag_name").and_then(|x| x.as_str()),
+        v.get("html_url").and_then(|x| x.as_str()),
+    ) {
+        (Some(tag), Some(url)) => {
+            Ok(serde_json::json!({ "tag": tag, "url": url }).to_string())
         }
-        cmd.arg("-H").arg("Accept: application/vnd.github+json");
-        cmd.arg(REPO_API);
-        if let Ok(out) = cmd.output() {
-            if out.status.success() {
-                let txt = String::from_utf8_lossy(&out.stdout);
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                    if let (Some(tag), Some(url)) = (
-                        v.get("tag_name").and_then(|x| x.as_str()),
-                        v.get("html_url").and_then(|x| x.as_str()),
-                    ) {
-                        return Ok(serde_json::json!({ "tag": tag, "url": url }).to_string());
-                    }
-                }
-                last_err = "响应解析失败".into();
-                continue;
-            }
-            last_err = format!("curl 退出码 {:?}", out.status.code());
-        } else {
-            last_err = "curl 不可用".into();
+        _ => Err("响应解析失败".into()),
+    }
+}
+
+/// 查询某 tag 的云端构建状态（GitHub Actions）
+#[tauri::command]
+fn ci_status(tag: String) -> Result<String, String> {
+    let txt = gh_api("/repos/WX308806058/shogun2-mod-doctor/actions/runs?per_page=15")?;
+    let v: serde_json::Value =
+        serde_json::from_str(&txt).map_err(|e| format!("响应解析失败: {}", e))?;
+    for run in v["workflow_runs"].as_array().into_iter().flatten() {
+        if run["head_branch"].as_str() == Some(tag.as_str()) {
+            let status = run["status"].as_str().unwrap_or("?").to_string();
+            let conclusion = run["conclusion"].as_str().unwrap_or("").to_string();
+            return Ok(
+                serde_json::json!({ "status": status, "conclusion": conclusion }).to_string()
+            );
         }
     }
-    Err(format!("无法访问 GitHub（可尝试开启 Clash 后重试）。{}", last_err))
+    Ok("{\"status\":\"not_found\",\"conclusion\":\"\"}".into())
+}
+
+/// 该 tag 的 Release 是否已发布（资产是否挂上）
+#[tauri::command]
+fn release_ready(tag: String) -> Result<bool, String> {
+    let txt = gh_api(&format!(
+        "/repos/WX308806058/shogun2-mod-doctor/releases/tags/{}",
+        tag
+    ))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&txt).map_err(|e| format!("响应解析失败: {}", e))?;
+    Ok(v.get("assets").map(|a| a.as_array().map(|x| !x.is_empty()).unwrap_or(false)).unwrap_or(false))
 }
 
 /// 用系统默认浏览器打开发布页（仅允许本仓库的链接）
@@ -242,6 +275,8 @@ fn main() {
             check_update,
             open_release_page,
             repo_status,
+            ci_status,
+            release_ready,
             publish_release
         ])
         .run(tauri::generate_context!())

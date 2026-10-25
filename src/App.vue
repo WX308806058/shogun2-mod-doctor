@@ -212,8 +212,47 @@ async function refreshStatus() {
 
 function openPublish() {
   pub.value = { show: true, version: "", commitMsg: "", notes: "", busy: false };
-  logs.value = [];
   refreshStatus();
+}
+
+const ciWatching = ref(false);
+
+async function watchCi(tag: string) {
+  ciWatching.value = true;
+  addLog(`开始监控 ${tag} 云端构建（每 15 秒查询，最长 25 分钟）…`);
+  let lastLoggedMinute = 0;
+  for (let elapsed = 0; elapsed <= 25 * 60 && ciWatching.value; elapsed += 15) {
+    await new Promise((r) => setTimeout(r, 15000));
+    if (!ciWatching.value) return;
+    let s: any = null;
+    try { s = JSON.parse(await invoke("ci_status", { tag })); } catch { continue; }
+    const min = Math.floor(elapsed / 60);
+    if (s.status === "completed") {
+      if (s.conclusion === "success") {
+        let ready = false;
+        try { ready = await invoke("release_ready", { tag }); } catch {}
+        if (ready) {
+          addLog(`✅ 云端构建成功，${tag} 安装包已发布！`);
+          addLog(`下载页：https://github.com/WX308806058/shogun2-mod-doctor/releases/tag/${tag}`);
+        } else {
+          addLog("✅ 构建成功，Release 资产上传中，稍后到 Releases 页查看。");
+        }
+      } else {
+        addLog(`❌ 云端构建失败（${s.conclusion}）。`);
+        addLog("Actions 日志：https://github.com/WX308806058/shogun2-mod-doctor/actions");
+      }
+      ciWatching.value = false;
+      return;
+    }
+    if (min > lastLoggedMinute) {
+      lastLoggedMinute = min;
+      if (min > 0) addLog(`构建中… 已等待 ${min} 分钟（状态：${s.status}）`);
+    }
+  }
+  if (ciWatching.value) {
+    addLog("超过 25 分钟仍未完成，停止自动监控。可稍后点「检查更新」或到 Actions 页查看。");
+    ciWatching.value = false;
+  }
 }
 
 async function doPublish(dryRun: boolean) {
@@ -230,6 +269,10 @@ async function doPublish(dryRun: boolean) {
       dryRun,
     });
     addLog(msg);
+    if (!dryRun) {
+      const tag = "v" + pub.value.version.trim().replace(/^v/, "");
+      watchCi(tag);
+    }
   } catch (e) {
     addLog("失败：" + String(e));
   } finally {

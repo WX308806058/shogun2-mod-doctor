@@ -9,9 +9,53 @@
       </div>
     </div>
 
-    <header>
-      <h1>幕府将军2 Mod 冲突检测器</h1>
-      <p class="sub">按游戏真实加载顺序（boot → release → patch → mod → movie）解析 pack 内 db 表，检测同名表覆盖冲突与科技生态悬空引用（加载页闪退高发原因）</p>
+    <!-- 检查更新结果 -->
+    <div v-if="updateInfo.show" class="modal-mask" @click.self="updateInfo.show = false">
+      <div class="modal">
+        <h3>检查更新</h3>
+        <template v-if="updateInfo.latest">
+          <p v-if="isNewer(updateInfo.latest, appVersion)" class="upd-new">
+            发现新版本 <b>v{{ updateInfo.latest }}</b>（当前 v{{ appVersion }}）
+          </p>
+          <p v-else class="upd-ok">已是最新版本（v{{ appVersion }}）</p>
+          <div class="row-btns">
+            <button v-if="isNewer(updateInfo.latest, appVersion)" class="primary" @click="openPage(updateInfo.url)">前往下载页</button>
+            <button class="ghost" @click="updateInfo.show = false">关闭</button>
+          </div>
+        </template>
+        <p v-else class="upd-err">{{ updateInfo.err }}</p>
+      </div>
+    </div>
+
+    <!-- 发布新版 -->
+    <div v-if="pub.show" class="modal-mask" @click.self="!pub.busy && (pub.show = false)">
+      <div class="modal left">
+        <h3>发布新版</h3>
+        <p class="pub-hint">将自动完成：git add/commit → 创建附注标签 → 推送 main + tag（走 Clash 代理），云端约 10 分钟出安装包。</p>
+        <label class="f-label">版本号（x.y.z）</label>
+        <input v-model="pub.version" class="f-input" placeholder="0.2.1" />
+        <label class="f-label">发布说明（写入 tag 注释与 Release 页）</label>
+        <textarea v-model="pub.notes" class="f-area" rows="4" placeholder="本版本更新内容…"></textarea>
+        <p v-if="pub.msg" class="pub-msg">{{ pub.msg }}</p>
+        <p v-if="pub.err" class="pub-err">{{ pub.err }}</p>
+        <div class="row-btns">
+          <button class="ghost" :disabled="pub.busy" @click="doPublish(true)">试运行</button>
+          <button class="primary" :disabled="pub.busy" @click="doPublish(false)">{{ pub.busy ? "推送中…" : "发布" }}</button>
+          <button class="ghost" :disabled="pub.busy" @click="pub.show = false">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <header class="hd">
+      <div>
+        <h1>幕府将军2 Mod 冲突检测器</h1>
+        <p class="sub">按游戏真实加载顺序（boot → release → patch → mod → movie）解析 pack 内 db 表，检测同名表覆盖冲突与科技生态悬空引用（加载页闪退高发原因）</p>
+      </div>
+      <div class="tools">
+        <span class="ver">v{{ appVersion }}</span>
+        <button class="ghost" :disabled="checking" @click="checkUpdate">{{ checking ? "检查中…" : "检查更新" }}</button>
+        <button class="ghost" @click="openPublish">发布新版</button>
+      </div>
     </header>
 
     <section class="bar">
@@ -60,7 +104,7 @@
       </section>
 
       <section class="block">
-        <h2>三、同名表覆盖冲突 <small>加载顺序靠后者覆盖靠前者</small></h2>
+        <h2>三、同名表覆盖冲突 <small>同 key 行按优先级取一个（列表靠前 / Movie 优先）</small></h2>
         <table v-if="report.conflicts.length">
           <thead><tr><th style="width:70px">级别</th><th style="width:320px">覆盖链（前 → 后）</th><th style="width:280px">db 表</th><th>结论</th></tr></thead>
           <tbody>
@@ -84,6 +128,7 @@
 import { ref, computed, onMounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import type { ScanReport } from "./types";
 
 const gameDir = ref("");
@@ -92,12 +137,73 @@ const scanning = ref(false);
 const report = ref<ScanReport | null>(null);
 const error = ref("");
 const progress = ref({ current: 0, total: 0, name: "" });
+const appVersion = ref("");
+const checking = ref(false);
+const updateInfo = ref<{ show: boolean; latest: string; url: string; err: string }>({
+  show: false, latest: "", url: "", err: "",
+});
+const pub = ref({ show: false, version: "", notes: "", busy: false, msg: "", err: "" });
+
 const pct = computed(() =>
   progress.value.total ? Math.round((progress.value.current / progress.value.total) * 100) : 0
 );
 
+function isNewer(latest: string, current: string): boolean {
+  const p = (s: string) => s.replace(/^v/, "").split(".").map((x) => parseInt(x) || 0);
+  const a = p(latest), b = p(current);
+  for (let i = 0; i < 3; i++) {
+    if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) > (b[i] || 0);
+  }
+  return false;
+}
+
+async function checkUpdate() {
+  checking.value = true;
+  try {
+    const res = await invoke<string>("check_update");
+    const { tag, url } = JSON.parse(res);
+    updateInfo.value = { show: true, latest: tag.replace(/^v/, ""), url, err: "" };
+  } catch (e) {
+    updateInfo.value = { show: true, latest: "", url: "", err: String(e) };
+  } finally {
+    checking.value = false;
+  }
+}
+
+function openPage(url: string) {
+  invoke("open_release_page", { url }).catch(() => {});
+}
+
+function openPublish() {
+  const parts = (appVersion.value || "0.2.0").split(".").map((x) => parseInt(x) || 0);
+  parts[2] += 1;
+  pub.value = { show: true, version: parts.join("."), notes: "", busy: false, msg: "", err: "" };
+}
+
+async function doPublish(dryRun: boolean) {
+  if (!pub.value.version.trim() || !pub.value.notes.trim()) {
+    pub.value.err = "版本号与发布说明都需要填写";
+    return;
+  }
+  pub.value.busy = true;
+  pub.value.msg = "";
+  pub.value.err = "";
+  try {
+    pub.value.msg = await invoke<string>("publish_release", {
+      version: pub.value.version.trim(),
+      notes: pub.value.notes.trim(),
+      dryRun,
+    });
+  } catch (e) {
+    pub.value.err = String(e);
+  } finally {
+    pub.value.busy = false;
+  }
+}
+
 onMounted(() => {
   invoke<string>("default_game_dir").then((d) => { if (d) gameDir.value = d; }).catch(() => {});
+  getVersion().then((v) => { appVersion.value = v; }).catch(() => {});
   listen<{ current: number; total: number; name: string }>("scan-progress", (e) => {
     progress.value = e.payload;
   }).catch(() => {});
@@ -157,6 +263,26 @@ th { background: #f0f2f5; }
 .mono { font-family: Consolas, monospace; font-size: 12px; word-break: break-all; }
 .small { font-size: 12px; }
 .tech { list-style: none; }
+.hd { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.tools { display: flex; gap: 8px; align-items: center; flex-shrink: 0; padding-top: 2px; }
+.ver { font-size: 12px; color: #889; }
+button.ghost { padding: 6px 14px; background: #fff; color: #2563eb; border: 1px solid #b9cdf3; border-radius: 6px; font-size: 12.5px; cursor: pointer; }
+button.ghost:hover { background: #eef4ff; }
+button.primary { padding: 7px 18px; background: #2563eb; color: #fff; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; }
+button.primary:hover { background: #1d4fd8; }
+button:disabled { opacity: .55; cursor: wait; }
+.modal.left { text-align: left; width: 500px; }
+.modal.left h3 { margin-bottom: 10px; }
+.pub-hint { font-size: 12px; color: #778; background: #f2f6ff; border-radius: 6px; padding: 8px 10px; margin-bottom: 12px; line-height: 1.6; }
+.f-label { display: block; font-size: 12.5px; color: #556; margin: 10px 0 4px; }
+.f-input, .f-area { width: 100%; padding: 8px 10px; border: 1px solid #ccd2d9; border-radius: 6px; font-size: 13px; font-family: inherit; box-sizing: border-box; }
+.f-area { resize: vertical; }
+.row-btns { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
+.pub-msg { font-size: 12.5px; color: #1e8449; background: #eaf7ef; border-radius: 6px; padding: 8px 10px; margin-top: 10px; white-space: pre-wrap; }
+.pub-err { font-size: 12.5px; color: #c0392b; background: #fdecea; border-radius: 6px; padding: 8px 10px; margin-top: 10px; white-space: pre-wrap; }
+.upd-new { font-size: 14px; margin: 8px 0; }
+.upd-ok { font-size: 14px; color: #1e8449; margin: 8px 0; }
+.upd-err { font-size: 13px; color: #c0392b; margin: 8px 0; word-break: break-all; }
 .modal-mask { position: fixed; inset: 0; background: rgba(30,40,60,.45); display: flex; align-items: center; justify-content: center; z-index: 50; }
 .modal { background: #fff; border-radius: 12px; padding: 26px 34px; width: 460px; box-shadow: 0 8px 30px rgba(0,0,0,.18); text-align: center; }
 .modal h3 { margin-bottom: 16px; font-size: 16px; }

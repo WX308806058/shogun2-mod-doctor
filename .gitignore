@@ -6,3 +6,4 @@ src-tauri/gen
 *.json.tmp
 runs.json
 rel.json
+rel24.json

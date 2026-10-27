@@ -56,9 +56,9 @@
         <label class="f-label">发布说明（可选：写入标签注释，显示在 GitHub Release 页面；留空则用固定文案）</label>
         <textarea v-model="pub.notes" class="f-area" rows="3" placeholder="本次更新内容…"></textarea>
         <div class="row-btns">
-          <button class="ghost" :disabled="pub.busy" @click="refreshStatus">刷新状态</button>
-          <button class="ghost" :disabled="pub.busy" @click="doPublish(true)">试运行</button>
-          <button class="primary" :disabled="pub.busy" @click="doPublish(false)">{{ pub.busy ? "推送中…" : "发布新版本" }}</button>
+          <button class="ghost" :disabled="pub.busy || statusBusy" @click="refreshStatus"><span v-if="statusBusy" class="spin"></span>{{ statusBusy ? "刷新中…" : "刷新状态" }}</button>
+          <button class="ghost" :disabled="pub.busy" @click="doPublish(true)"><span v-if="pub.busy && dryRunning" class="spin"></span>试运行</button>
+          <button class="primary" :disabled="pub.busy" @click="doPublish(false)"><span v-if="pub.busy && !dryRunning" class="spin"></span>{{ pub.busy ? (dryRunning ? "试运行中…" : "推送中…") : "发布新版本" }}</button>
           <button class="ghost" :disabled="pub.busy" @click="pub.show = false">关闭</button>
         </div>
         <label class="f-label">执行日志（{{ logs.length }} 条）</label>
@@ -76,7 +76,7 @@
       </div>
       <div class="tools">
         <span class="ver">v{{ appVersion }}</span>
-        <button class="ghost" :disabled="checking" @click="checkUpdate">{{ checking ? "检查中…" : "检查更新" }}</button>
+        <button class="ghost" :disabled="checking" @click="checkUpdate"><span v-if="checking" class="spin"></span>{{ checking ? "检查中…" : "检查更新" }}</button>
         <button class="ghost" @click="openPublish">发布新版</button>
       </div>
     </header>
@@ -162,6 +162,8 @@ const error = ref("");
 const progress = ref({ current: 0, total: 0, name: "" });
 const appVersion = ref("");
 const checking = ref(false);
+const statusBusy = ref(false);
+const dryRunning = ref(false);
 const updateInfo = ref<{ show: boolean; latest: string; url: string; asset: string; err: string; downloading: boolean; downloaded: string }>({
   show: false, latest: "", url: "", asset: "", err: "", downloading: false, downloaded: "",
 });
@@ -228,6 +230,7 @@ function openPage(url: string) {
 }
 
 async function refreshStatus() {
+  statusBusy.value = true;
   try {
     const s = await invoke<any>("repo_status");
     pubStatus.value = { ...s, err: "" };
@@ -235,6 +238,8 @@ async function refreshStatus() {
     if (!pub.value.commitMsg) pub.value.commitMsg = `chore: release v${s.nextVersion}`;
   } catch (e) {
     pubStatus.value = { ...pubStatus.value, err: String(e) };
+  } finally {
+    statusBusy.value = false;
   }
 }
 
@@ -289,6 +294,8 @@ async function doPublish(dryRun: boolean) {
     return;
   }
   pub.value.busy = true;
+  dryRunning.value = dryRun;
+  addLog(dryRun ? "试运行：检查版本与暂存变更（不推送）…" : "开始发布流程…");
   try {
     const msg = await invoke<string>("publish_release", {
       version: pub.value.version.trim(),
@@ -374,6 +381,8 @@ th { background: #f0f2f5; }
 .mono { font-family: Consolas, monospace; font-size: 12px; word-break: break-all; }
 .small { font-size: 12px; }
 .tech { list-style: none; }
+.spin { display: inline-block; width: 12px; height: 12px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: rot .7s linear infinite; vertical-align: -2px; margin-right: 6px; }
+@keyframes rot { to { transform: rotate(360deg); } }
 .hd { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
 .tools { display: flex; gap: 8px; align-items: center; flex-shrink: 0; padding-top: 2px; }
 .ver { font-size: 12px; color: #889; }

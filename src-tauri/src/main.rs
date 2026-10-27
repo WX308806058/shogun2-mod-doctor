@@ -9,7 +9,7 @@ use tauri::{Emitter, Manager};
 
 const DEFAULT_GAME: &str = "D:/Program Files/Steam/steamapps/common/Total War SHOGUN 2";
 /// 发布功能使用的本机仓库路径（发布功能仅限开发机）
-const PROJECT_DIR: &str = "D:/Shou2Mods/Shogun2ModDoctor";
+const PROJECT_DIR: &str = "D:/JetBrains/ViteProject/Shogun2ModDoctor";
 const REPO_API: &str = "https://api.github.com/repos/WX308806058/shogun2-mod-doctor/releases/latest";
 const REPO_BASE: &str = "https://github.com/WX308806058/shogun2-mod-doctor";
 const PROXY: &str = "http://127.0.0.1:7890";

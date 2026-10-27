@@ -14,24 +14,93 @@ const REPO_API: &str = "https://api.github.com/repos/WX308806058/shogun2-mod-doc
 const REPO_BASE: &str = "https://github.com/WX308806058/shogun2-mod-doctor";
 const PROXY: &str = "http://127.0.0.1:7890";
 
-/// GitHub API 请求：curl 优先走代理，失败自动直连
-fn gh_api(path: &str) -> Result<String, String> {
+/// GitHub API 请求：curl 优先走代理，失败自动直连；带认证时限额从 60/h 提升到 5000/h。
+/// 返回 (HTTP 状态码, 响应体)
+fn gh_api(path: &str) -> Result<(u32, String), String> {
+    // 一次性读取本机 git 凭据里的 GitHub token（无则匿名请求）
+    static GH_TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let token = GH_TOKEN.get_or_init(|| {
+        use std::io::Write;
+        let child = Command::new("git")
+            .args(["credential", "fill"])
+            .env("GCM_INTERACTIVE", "never")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn();
+        let mut child = match child {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+        if let Some(mut sin) = child.stdin.take() {
+            let _ = sin.write_all(b"protocol=https\nhost=github.com\n\n");
+        }
+        if let Ok(o) = child.wait_with_output() {
+            let txt = String::from_utf8_lossy(&o.stdout);
+            for line in txt.lines() {
+                if let Some(pw) = line.strip_prefix("password=") {
+                    let t = pw.trim().to_string();
+                    if !t.is_empty() {
+                        return Some(t);
+                    }
+                }
+            }
+        }
+        None
+    });
+
     for use_proxy in [true, false] {
         let mut cmd = Command::new("curl");
         hide_window(&mut cmd);
         cmd.arg("-s").arg("-m").arg("20").arg("-L");
+        cmd.arg("-w").arg("\n__GH_CODE__%{http_code}");
         if use_proxy {
             cmd.arg("--proxy").arg(PROXY);
         }
         cmd.arg("-H").arg("Accept: application/vnd.github+json");
+        if let Some(tok) = token {
+            cmd.arg("-H").arg(format!("Authorization: Bearer {}", tok));
+        }
         cmd.arg(format!("https://api.github.com{}", path));
         if let Ok(out) = cmd.output() {
-            if out.status.success() && !out.stdout.is_empty() {
-                return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+            if !out.status.success() {
+                continue;
+            }
+            let txt = String::from_utf8_lossy(&out.stdout).into_owned();
+            if let Some(pos) = txt.find("\n__GH_CODE__") {
+                let code: u32 = txt[pos + 12..].trim().parse().unwrap_or(0);
+                let body = txt[..pos].to_string();
+                if !body.is_empty() {
+                    return Ok((code, body));
+                }
             }
         }
     }
     Err("无法访问 GitHub API（可尝试开启 Clash 后重试）".into())
+}
+
+/// gh_api + JSON 解析 + 常见错误翻译（限流 / 404 / 非 JSON）
+fn gh_json(path: &str) -> Result<serde_json::Value, String> {
+    let (code, body) = gh_api(path)?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
+        format!(
+            "GitHub 返回非 JSON（HTTP {}）：{}",
+            code,
+            body.chars().take(120).collect::<String>()
+        )
+    })?;
+    // releases/latest 无 Release 时返回 404 + message
+    if code != 200 && v.get("message").is_some() {
+        let msg = v["message"].as_str().unwrap_or("").to_string();
+        if code == 403 && msg.contains("rate limit") {
+            return Err("GitHub API 匿名限流（60 次/小时/IP），请稍后再试或开启代理更换出口".into());
+        }
+        if code == 404 {
+            return Err("该仓库还没有发布过 Release".into());
+        }
+        return Err(format!("GitHub API 错误（HTTP {}）：{}", code, msg));
+    }
+    Ok(v)
 }
 
 #[tauri::command]
@@ -90,9 +159,7 @@ fn run_git(dir: &str, proxy: bool, args: &[&str]) -> Result<String, String> {
 /// 检查更新：查 GitHub 最新 Release，返回 tag / 发布页 / 安装包直链
 #[tauri::command]
 fn check_update() -> Result<String, String> {
-    let txt = gh_api("/repos/WX308806058/shogun2-mod-doctor/releases/latest")?;
-    let v: serde_json::Value =
-        serde_json::from_str(&txt).map_err(|e| format!("响应解析失败: {}", e))?;
+    let v = gh_json("/repos/WX308806058/shogun2-mod-doctor/releases/latest")?;
     let tag = v
         .get("tag_name")
         .and_then(|x| x.as_str())
@@ -181,9 +248,7 @@ fn install_update(path: String) -> Result<(), String> {
 /// 查询某 tag 的云端构建状态（GitHub Actions）
 #[tauri::command]
 fn ci_status(tag: String) -> Result<String, String> {
-    let txt = gh_api("/repos/WX308806058/shogun2-mod-doctor/actions/runs?per_page=15")?;
-    let v: serde_json::Value =
-        serde_json::from_str(&txt).map_err(|e| format!("响应解析失败: {}", e))?;
+    let v = gh_json("/repos/WX308806058/shogun2-mod-doctor/actions/runs?per_page=15")?;
     for run in v["workflow_runs"].as_array().into_iter().flatten() {
         if run["head_branch"].as_str() == Some(tag.as_str()) {
             let status = run["status"].as_str().unwrap_or("?").to_string();
@@ -196,16 +261,23 @@ fn ci_status(tag: String) -> Result<String, String> {
     Ok("{\"status\":\"not_found\",\"conclusion\":\"\"}".into())
 }
 
-/// 该 tag 的 Release 是否已发布（资产是否挂上）
+/// 该 tag 的 Release 是否已发布（资产是否挂上）；404 = 尚未发布
 #[tauri::command]
 fn release_ready(tag: String) -> Result<bool, String> {
-    let txt = gh_api(&format!(
+    match gh_api(&format!(
         "/repos/WX308806058/shogun2-mod-doctor/releases/tags/{}",
         tag
-    ))?;
-    let v: serde_json::Value =
-        serde_json::from_str(&txt).map_err(|e| format!("响应解析失败: {}", e))?;
-    Ok(v.get("assets").map(|a| a.as_array().map(|x| !x.is_empty()).unwrap_or(false)).unwrap_or(false))
+    )) {
+        Ok((_, body)) => {
+            let v: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| format!("响应解析失败: {}", e))?;
+            Ok(v.get("assets")
+                .map(|a| a.as_array().map(|x| !x.is_empty()).unwrap_or(false))
+                .unwrap_or(false))
+        }
+        Err(e) if e.contains("404") => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// 用系统默认浏览器打开发布页（仅允许本仓库的链接）

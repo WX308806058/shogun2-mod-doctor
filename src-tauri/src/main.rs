@@ -18,6 +18,7 @@ const PROXY: &str = "http://127.0.0.1:7890";
 fn gh_api(path: &str) -> Result<String, String> {
     for use_proxy in [true, false] {
         let mut cmd = Command::new("curl");
+        hide_window(&mut cmd);
         cmd.arg("-s").arg("-m").arg("20").arg("-L");
         if use_proxy {
             cmd.arg("--proxy").arg(PROXY);
@@ -58,10 +59,21 @@ fn scan_game(
     scan::do_scan(&game_dir, include_all, Some(&cb))
 }
 
+/// GUI 程序启动控制台子进程（git/curl/cmd）时隐藏弹出的命令窗口
+#[cfg(windows)]
+fn hide_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+#[cfg(not(windows))]
+fn hide_window(_cmd: &mut Command) {}
+
 /// 在指定目录执行 git，proxy=true 时临时挂 Clash 代理
 fn run_git(dir: &str, proxy: bool, args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new("git");
     cmd.current_dir(dir);
+    hide_window(&mut cmd);
     if proxy {
         cmd.arg("-c").arg(format!("http.proxy={}", PROXY));
         cmd.arg("-c").arg(format!("https.proxy={}", PROXY));
@@ -126,6 +138,7 @@ fn download_update(asset_url: String) -> Result<String, String> {
     for u in &sources {
         for use_proxy in [true, false] {
             let mut cmd = Command::new("curl");
+            hide_window(&mut cmd);
             cmd.arg("-sSL")
                 .arg("--retry")
                 .arg("2")
@@ -201,8 +214,9 @@ fn open_release_page(url: String) -> Result<(), String> {
     if !url.starts_with("https://github.com/WX308806058/shogun2-mod-doctor") {
         return Err("不允许打开外部链接".into());
     }
-    Command::new("cmd")
-        .args(["/C", "start", "", &url])
+    let mut cmd = Command::new("cmd");
+    hide_window(&mut cmd);
+    cmd.args(["/C", "start", "", &url])
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())

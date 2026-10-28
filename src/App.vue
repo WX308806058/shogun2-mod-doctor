@@ -9,6 +9,43 @@
       </div>
     </div>
 
+    <!-- 覆盖链详情 -->
+    <div v-if="detail.show" class="modal-mask" @click.self="detail.show = false">
+      <div class="modal left wide">
+        <h3>覆盖链详情</h3>
+        <p class="detail-title">{{ detail.title }}</p>
+        <p v-if="detail.loading" class="pub-hint">解析相关包中…</p>
+        <p v-else-if="detail.err" class="pub-err">{{ detail.err }}</p>
+        <template v-else-if="detail.data">
+          <p class="pub-hint">按优先级从高到低排列。同 key 行冲突时以「赢家」为准；各输家包"独有内容"是它额外贡献、赢家表中没有的行。</p>
+          <table class="dtable">
+            <thead><tr><th>优先级</th><th>包</th><th>类型</th><th>布局</th><th>行数</th><th>大小</th><th>指纹</th><th></th></tr></thead>
+            <tbody>
+              <tr v-for="(c, i) in detail.data.chain" :key="i" :class="{ winner: c.isWinner }">
+                <td>{{ i + 1 }}</td>
+                <td class="mono">{{ c.pack }}</td>
+                <td>{{ c.ptype }}</td>
+                <td class="mono">{{ c.layout }} v{{ c.ver }}</td>
+                <td>{{ c.rows || "-" }}</td>
+                <td>{{ (c.size / 1024).toFixed(1) }} KB</td>
+                <td class="mono small">{{ c.hash.slice(0, 8) }}</td>
+                <td><span v-if="c.isWinner" class="win-badge">赢家</span></td>
+              </tr>
+            </tbody>
+          </table>
+          <template v-for="c in detail.data.chain" :key="'d' + c.hash + c.pack">
+            <details v-if="!c.isWinner && c.uniqueCount" class="uniq">
+              <summary>{{ c.pack }} 独有内容（{{ c.uniqueCount }} 项，赢家表中没有）</summary>
+              <div class="uniq-list">
+                <span v-for="u in c.uniqueSample" :key="u" class="uniq-item mono">{{ u }}</span>
+                <span v-if="c.uniqueCount > c.uniqueSample.length" class="uniq-item">…共 {{ c.uniqueCount }} 项</span>
+              </div>
+            </details>
+          </template>
+        </template>
+      </div>
+    </div>
+
     <!-- 检查更新结果 -->
     <div v-if="updateInfo.show" class="modal-mask" @click.self="!updateInfo.downloading && (updateInfo.show = false)">
       <div class="modal">
@@ -129,9 +166,9 @@
       <section class="block">
         <h2>三、同名表覆盖冲突 <small>同 key 行按优先级取一个（列表靠前 / Movie 优先）</small></h2>
         <table v-if="report.conflicts.length">
-          <thead><tr><th style="width:70px">级别</th><th style="width:320px">覆盖链（前 → 后）</th><th style="width:280px">db 表</th><th>结论</th></tr></thead>
+          <thead><tr><th style="width:70px">级别</th><th style="width:320px">覆盖链（前 → 后）</th><th style="width:280px">db 表</th><th>结论<small>　点击行查看逐包详情</small></th></tr></thead>
           <tbody>
-            <tr v-for="(c, i) in report.conflicts" :key="i">
+            <tr v-for="(c, i) in report.conflicts" :key="i" class="clickable" title="点击查看覆盖链逐包详情" @click="showDetail(c.table)">
               <td><span class="tag" :class="c.level.toLowerCase()">{{ levelText(c.level) }}</span></td>
               <td class="mono small">{{ c.chain.join(" → ") }}</td>
               <td class="mono small">{{ c.table }}</td>
@@ -249,6 +286,23 @@ function openPublish() {
 }
 
 const ciWatching = ref(false);
+const detail = ref<{ show: boolean; loading: boolean; title: string; err: string; data: any }>({
+  show: false, loading: false, title: "", err: "", data: null,
+});
+
+async function showDetail(table: string) {
+  detail.value = { show: true, loading: true, title: table, err: "", data: null };
+  try {
+    detail.value.data = await invoke<any>("table_detail", {
+      gameDir: gameDir.value.trim(),
+      table,
+    });
+  } catch (e) {
+    detail.value.err = String(e);
+  } finally {
+    detail.value.loading = false;
+  }
+}
 
 async function watchCi(tag: string) {
   ciWatching.value = true;
@@ -409,6 +463,19 @@ button:disabled { opacity: .55; cursor: wait; }
 .upd-new { font-size: 14px; margin: 8px 0; }
 .upd-ok { font-size: 14px; color: #1e8449; margin: 8px 0; }
 .upd-err { font-size: 13px; color: #c0392b; margin: 8px 0; word-break: break-all; }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover { background: #f4f7ff; }
+.modal.wide { width: 780px; max-width: 94vw; }
+.detail-title { font-family: Consolas, monospace; font-size: 12.5px; color: #345; background: #f2f6ff; border-radius: 6px; padding: 8px 10px; word-break: break-all; }
+.dtable { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+.dtable th, .dtable td { padding: 6px 8px; border-bottom: 1px solid #e8ebf0; text-align: left; }
+.dtable th { color: #667; font-weight: 500; background: #fafbfd; }
+.dtable tr.winner { background: #eaf7ef; }
+.win-badge { background: #1e8449; color: #fff; font-size: 11px; border-radius: 4px; padding: 2px 8px; }
+details.uniq { margin-top: 10px; border: 1px solid #e8ebf0; border-radius: 8px; padding: 8px 12px; }
+details.uniq summary { cursor: pointer; font-size: 12.5px; color: #2563eb; }
+.uniq-list { margin-top: 8px; }
+.uniq-item { display: inline-block; background: #f1f3f7; border-radius: 4px; padding: 2px 8px; margin: 2px; font-size: 11.5px; }
 .modal-mask { position: fixed; inset: 0; background: rgba(30,40,60,.45); display: flex; align-items: center; justify-content: center; z-index: 50; }
 .modal { background: #fff; border-radius: 12px; padding: 26px 34px; width: 460px; box-shadow: 0 8px 30px rgba(0,0,0,.18); text-align: center; }
 .modal h3 { margin-bottom: 16px; font-size: 16px; }

@@ -280,6 +280,102 @@ fn release_ready(tag: String) -> Result<bool, String> {
     }
 }
 
+/// 覆盖链详情：某张表/文件在所有包中的逐包对比（按优先级从高到低）
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChainPack {
+    pack: String,
+    ptype: String,
+    layout: String,
+    ver: i32,
+    rows: u32,
+    size: usize,
+    hash: String,
+    is_winner: bool,
+    unique_count: usize,
+    unique_sample: Vec<String>,
+}
+
+#[tauri::command]
+fn table_detail(game_dir: String, table: String) -> Result<serde_json::Value, String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    fn blob_hash(b: &[u8]) -> String {
+        let mut h = DefaultHasher::new();
+        b.hash(&mut h);
+        format!("{:016x}", h.finish())
+    }
+    let order = scan::build_load_order(&game_dir, false);
+    let target = table.replace('/', "\\").to_lowercase();
+    let is_db = target.starts_with("db\\");
+    let mut chain: Vec<ChainPack> = Vec::new();
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    let mut ranks: Vec<u32> = Vec::new();
+    for item in &order {
+        let (ents, _) = pack::read_pack(&item.path).unwrap_or((Vec::new(), None));
+        for e in &ents {
+            if e.name.to_lowercase() == target {
+                let (layout, ver, rows) = match dbtable::classify(&e.data) {
+                    Some(i) => (i.layout.clone(), i.ver, i.rows),
+                    None => ("FILE".into(), 0, 0),
+                };
+                chain.push(ChainPack {
+                    pack: std::path::Path::new(&item.path)
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    ptype: item.tag.clone(),
+                    layout,
+                    ver,
+                    rows,
+                    size: e.data.len(),
+                    hash: blob_hash(&e.data),
+                    is_winner: false,
+                    unique_count: 0,
+                    unique_sample: vec![],
+                });
+                blobs.push(e.data.clone());
+                ranks.push(item.rank);
+            }
+        }
+    }
+    if chain.is_empty() {
+        return Err("未在任何包中找到该路径".into());
+    }
+    let wi = ranks
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, r)| **r)
+        .map(|(i, _)| i)
+        .unwrap();
+    chain[wi].is_winner = true;
+    let winner_set = if is_db {
+        dbtable::extract_strings(&blobs[wi])
+    } else {
+        Default::default()
+    };
+    for (i, c) in chain.iter_mut().enumerate() {
+        if i == wi || !is_db {
+            continue;
+        }
+        let mut uniques: Vec<String> =
+            dbtable::extract_strings(&blobs[i]).difference(&winner_set).cloned().collect();
+        uniques.sort();
+        c.unique_count = uniques.len();
+        c.unique_sample = uniques.into_iter().take(30).collect();
+    }
+    // 按优先级从高到低输出
+    let mut order_idx: Vec<usize> = (0..chain.len()).collect();
+    order_idx.sort_by(|a, b| ranks[*b].cmp(&ranks[*a]));
+    let chain_sorted: Vec<&ChainPack> = order_idx.into_iter().map(|i| &chain[i]).collect();
+    Ok(serde_json::json!({
+        "table": table,
+        "winner": chain[wi].pack,
+        "chain": chain_sorted,
+    }))
+}
+
 /// 用系统默认浏览器打开发布页（仅允许本仓库的链接）
 #[tauri::command]
 fn open_release_page(url: String) -> Result<(), String> {
@@ -438,6 +534,7 @@ fn main() {
             repo_status,
             ci_status,
             release_ready,
+            table_detail,
             publish_release
         ])
         .run(tauri::generate_context!())

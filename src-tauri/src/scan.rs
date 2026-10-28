@@ -105,7 +105,7 @@ fn read_used_mods(game: &str) -> (Option<Vec<String>>, Vec<String>) {
 }
 
 /// 按真实加载顺序收集 pack → LoadItem（path / 类型标签 / 优先级 rank）
-fn build_load_order(game: &str, include_all: bool) -> Vec<LoadItem> {
+pub fn build_load_order(game: &str, include_all: bool) -> Vec<LoadItem> {
     let data_dir = Path::new(game).join("data");
     let (used_opt, wdirs) = read_used_mods(game);
     let used = used_opt.unwrap_or_default();
